@@ -2,7 +2,7 @@ function textFromMessage(message) {
   return [message.content || '', ...(message.embeds || []).flatMap(e => [
     e.title || '', e.description || '',
     ...(e.fields || []).map(f => `${f.name}: ${f.value}`), e.footer?.text || ''
-  ])].filter(Boolean).join('\n');
+  ])].filter(Boolean).join('\n').replace(/[\*_~`]/g, '');
 }
 
 function parseEvent(message) {

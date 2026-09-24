@@ -58,6 +58,7 @@ const commands = [
   new SlashCommandBuilder().setName('ranches').setDescription('List connected ranches'),
   choose(new SlashCommandBuilder().setName('ranchstats').setDescription('Show product, animal, and sales figures')),
   choose(new SlashCommandBuilder().setName('refresh_ranch').setDescription('Rebuild figures from webhook history')),
+  choose(new SlashCommandBuilder().setName('checkranch').setDescription('Check webhook access and parsing for a ranch')),
   choose(new SlashCommandBuilder().setName('addemployee').setDescription('Add a person to a ranch employee list'))
     .addStringOption(o => o.setName('name').setDescription('In-game name as it appears in webhooks').setRequired(true)),
   choose(new SlashCommandBuilder().setName('employee').setDescription('Show one employee’s ranch activity'))
@@ -172,6 +173,34 @@ client.on('interactionCreate', async i => {
       await i.deferReply({ ephemeral: true });
       const result = await refresh(i.guildId, key);
       return await i.editReply(`Read ${result.scanned} messages; recognised ${result.accepted} ranch events.`);
+    }
+    if (name === 'checkranch') {
+      await i.deferReply({ ephemeral: true });
+      let channel;
+      try { channel = await client.channels.fetch(store.channelId); }
+      catch (error) {
+        if (error.code === 50001 || error.code === 50013 || error.code === 10003)
+          return await i.editReply(`I cannot access <#${store.channelId}>. Check View Channel and Read Message History for the bot in that channel.`);
+        throw error;
+      }
+      const permissions = channel.permissionsFor(client.user.id);
+      if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]))
+        return await i.editReply(`I need View Channel and Read Message History in <#${store.channelId}>.`);
+      let messages;
+      try { messages = await channel.messages.fetch({ limit: 100 }); }
+      catch (error) {
+        if (error.code === 50001 || error.code === 50013)
+          return await i.editReply(`Discord denied message history in <#${store.channelId}>. Give the bot View Channel and Read Message History there.`);
+        throw error;
+      }
+      const events = [...messages.values()].map(m => ({ event: parseEvent(m), title: m.embeds?.[0]?.title || '(no embed title)' }));
+      const recognised = events.filter(e => e.event);
+      const matching = recognised.filter(e => !store.ranchId || e.event.ranch.id === store.ranchId);
+      const sample = events.find(e => e.title !== '(no embed title)')?.title || 'None';
+      return await i.editReply(`Channel: <#${store.channelId}> · Ranch ID filter: ${store.ranchId || 'auto'}\n` +
+        `Last ${messages.size} messages: ${recognised.length} recognised ranch events, ${matching.length} matched this ranch.\n` +
+        `Example embed title: ${sample}\nStored employee names: ${Object.keys(store.employees || {}).length}. ` +
+        `Use /refresh_ranch to import older events after permissions are fixed.`);
     }
     if (name === 'addemployee') {
       const employeeName = i.options.getString('name', true).trim();

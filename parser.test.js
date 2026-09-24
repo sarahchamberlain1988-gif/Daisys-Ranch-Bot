@@ -36,3 +36,16 @@ test('five animal types and individual workers', () => {
     'Ella Hayes delivered 4 of 5 sheep (quality 200) for $1,472 — seller cut $368, ledger $1104'));
   assert.deepEqual([sale.kind, sale.quantity, sale.dispatched, sale.actor], ['sheep', 4, 5, 'Ella Hayes']);
 });
+test('Discord bold markup in embed description and footer', () => {
+  const embeds = [
+    { title: '🥚 Eggs Collected', description: '**Daisy Bennett** collected **52 eggs** (ranch total: **236**)',
+      footer: { text: 'Hanging Dog Ranch (Ranch #52) • Today at 10:15' } },
+    { title: '🐄 Cattle Bought', description: '**Daisy Bennett** bought **5x cow** for **$900**',
+      footer: { text: 'Hanging Dog Ranch (Ranch #52) • Today at 11:21' } },
+    { title: '💰 Cattle Sold', description: '**Daisy Bennett** delivered **2 of 5 cow** (quality 200) for **$1472** — seller cut **$368**, ledger **$1104**',
+      footer: { text: 'Hanging Dog Ranch (Ranch #52) • Today at 10:56' } }
+  ];
+  assert.deepEqual(embeds.map(embed => parseEvent({ embeds: [embed] })?.type),
+    ['product', 'animal', 'sale']);
+  assert.equal(parseEvent({ embeds: [embeds[0]] }).actor, 'Daisy Bennett');
+});
