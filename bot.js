@@ -3,6 +3,7 @@ const path = require('node:path');
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
 const { parseEvent } = require('./parser');
+const { keyFor: employeeKey, ensureEmployee, recordEmployee, settleEmployee } = require('./employee');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = '1552627525237346434';
@@ -23,14 +24,7 @@ function fresh(name, channelId, ranchId = null, ownerId = null) {
   return { name, channelId, ranchId, products: {}, animals: {},
     ownerId, employees: {}, purchases: {}, sales: { count: 0, revenue: 0, sellerCut: 0, ledgerShare: 0 }, seen: {} };
 }
-const employeeKey = value => value.trim().toLocaleLowerCase('en-GB').replace(/\s+/g, ' ');
-function ensureEmployee(store, name) {
-  store.employees ||= {};
-  const key = employeeKey(name);
-  return store.employees[key] ||= { name: name.trim(), collected: {}, bought: {},
-    sold: {}, purchaseCost: 0, saleRevenue: 0, sellerCut: 0, events: 0 };
-}
-function apply(store, event, messageId) {
+function apply(store, event, messageId, timestamp) {
   if (!event || store.seen[messageId]) return false;
   if (store.ranchId && event.ranch.id !== store.ranchId) return false;
   if (!store.ranchId) store.ranchId = event.ranch.id;
@@ -47,20 +41,7 @@ function apply(store, event, messageId) {
     store.sales.sellerCut += event.sellerCut;
     store.sales.ledgerShare += event.ledgerShare;
   }
-  if (event.actor) {
-    const person = ensureEmployee(store, event.actor);
-    person.events++;
-    if (event.type === 'product') person.collected[event.kind] = (person.collected[event.kind] || 0) + event.quantity;
-    if (event.type === 'animal') {
-      person.bought[event.kind] = (person.bought[event.kind] || 0) + event.delta;
-      person.purchaseCost += event.paid;
-    }
-    if (event.type === 'sale') {
-      person.sold[event.kind] = (person.sold[event.kind] || 0) + event.quantity;
-      person.saleRevenue += event.revenue;
-      person.sellerCut += event.sellerCut;
-    }
-  }
+  recordEmployee(store, event, timestamp);
   return true;
 }
 const admin = PermissionFlagsBits.ManageGuild;
@@ -80,29 +61,51 @@ const commands = [
   choose(new SlashCommandBuilder().setName('addemployee').setDescription('Add a person to a ranch employee list'))
     .addStringOption(o => o.setName('name').setDescription('In-game name as it appears in webhooks').setRequired(true)),
   choose(new SlashCommandBuilder().setName('employee').setDescription('Show one employee’s ranch activity'))
+    .addStringOption(o => o.setName('name').setDescription('Employee name').setRequired(true).setAutocomplete(true)),
+  choose(new SlashCommandBuilder().setName('settleemployee').setDescription('Mark an employee’s pay or products as handled'))
     .addStringOption(o => o.setName('name').setDescription('Employee name').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('category').setDescription('What have you settled?').setRequired(true)
+      .addChoices({ name: 'Products handed out', value: 'products' },
+        { name: 'Pay handed out', value: 'pay' }, { name: 'Both', value: 'both' }))
 ].map(c => c.toJSON());
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
   GatewayIntentBits.MessageContent] });
 async function refresh(guildId, key) {
   const old = ranch(guildId, key);
   if (!old) throw new Error('Ranch not found.');
-  const channel = await client.channels.fetch(old.channelId);
+  let channel;
+  try { channel = await client.channels.fetch(old.channelId); }
+  catch (error) {
+    if (error.code === 50001 || error.code === 50013 || error.code === 10003)
+      throw new Error(`I cannot access <#${old.channelId}>. In that channel's Permissions, give Daisy's Ranch Bot View Channel and Read Message History, then try again.`);
+    throw error;
+  }
   if (!channel?.messages?.fetch) throw new Error('Cannot read the configured channel.');
+  const permissions = channel.permissionsFor(client.user.id);
+  if (!permissions?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]))
+    throw new Error(`I need View Channel and Read Message History in <#${old.channelId}>. Check that channel's permission overrides for Daisy's Ranch Bot.`);
   const messages = [];
   let before;
   for (;;) {
-    const batch = await channel.messages.fetch({ limit: 100, before });
+    let batch;
+    try { batch = await channel.messages.fetch({ limit: 100, before }); }
+    catch (error) {
+      if (error.code === 50001 || error.code === 50013)
+        throw new Error(`I cannot read messages in <#${old.channelId}>. Give Daisy's Ranch Bot View Channel and Read Message History there.`);
+      throw error;
+    }
     if (!batch.size) break;
     messages.push(...batch.values());
     before = batch.last().id;
     if (batch.size < 100) break;
   }
   const next = fresh(old.name, old.channelId, old.ranchId, old.ownerId);
-  for (const person of Object.values(old.employees || {})) ensureEmployee(next, person.name);
+  for (const person of Object.values(old.employees || {})) {
+    ensureEmployee(next, person.name).cutoffs = { ...(person.cutoffs || {}) };
+  }
   let accepted = 0;
   for (const msg of messages.sort((a, b) => a.createdTimestamp - b.createdTimestamp)) {
-    if (apply(next, parseEvent(msg), msg.id)) accepted++;
+    if (apply(next, parseEvent(msg), msg.id, msg.createdTimestamp)) accepted++;
   }
   guild(guildId).ranches[key] = next;
   save();
@@ -120,7 +123,7 @@ client.on('messageCreate', message => {
   const event = parseEvent(message);
   if (!event) return;
   for (const store of Object.values(guild(message.guildId).ranches)) {
-    if (store.channelId === message.channelId && apply(store, event, message.id)) save();
+    if (store.channelId === message.channelId && apply(store, event, message.id, message.createdTimestamp)) save();
   }
 });
 client.on('interactionCreate', async i => {
@@ -159,7 +162,7 @@ client.on('interactionCreate', async i => {
     const key = i.options.getString('ranch', true);
     const store = ranch(i.guildId, key);
     if (!store) return await i.reply({ content: 'Ranch not found.', ephemeral: true });
-    if (['removeranch', 'refresh_ranch', 'addemployee'].includes(name) && !canManage(i, store))
+    if (['removeranch', 'refresh_ranch', 'addemployee', 'settleemployee'].includes(name) && !canManage(i, store))
       return await i.reply({ content: 'Only the person who added this ranch or a server manager can do that.', ephemeral: true });
     if (name === 'removeranch') {
       delete guild(i.guildId).ranches[key]; save();
@@ -178,6 +181,14 @@ client.on('interactionCreate', async i => {
       ensureEmployee(store, employeeName); save();
       return await i.reply({ content: already ? 'That employee is already listed.' : `Added **${employeeName}** to **${store.name}**.`, ephemeral: true });
     }
+    if (name === 'settleemployee') {
+      const person = store.employees?.[employeeKey(i.options.getString('name', true))];
+      if (!person) return await i.reply({ content: 'Employee not found. Use /employee to check the name.', ephemeral: true });
+      const category = i.options.getString('category', true);
+      settleEmployee(person, category);
+      save();
+      return await i.reply({ content: `Marked **${person.name}**'s **${category}** as settled. New matching webhooks will count from now on; /refresh_ranch will keep this cutoff.`, ephemeral: true });
+    }
     if (name === 'employee') {
       const lookup = employeeKey(i.options.getString('name', true));
       const person = store.employees?.[lookup];
@@ -189,7 +200,7 @@ client.on('interactionCreate', async i => {
           { name: 'Animals bought', value: line(person.bought) },
           { name: 'Animals delivered in sales', value: line(person.sold) },
           { name: 'Recorded sale figures', value: `Gross: $${person.saleRevenue} · Seller cuts: $${person.sellerCut}` })
-        .setFooter({ text: `${person.events} recognised events · Names are taken from webhooks` })] });
+        .setFooter({ text: 'Products and sale figures are since their last respective settlement; purchases are all recorded history.' })] });
     }
     if (name === 'ranchstats') {
       const products = Object.entries(store.products).map(([k, v]) => `${k}: **${v}**`).join('\n') || 'No product totals yet';
