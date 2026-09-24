@@ -233,14 +233,12 @@ client.on('interactionCreate', async i => {
     }
     if (name === 'ranchstats') {
       const products = Object.entries(store.products).map(([k, v]) => `${k}: **${v}**`).join('\n') || 'No product totals yet';
-      const animals = ['cow', 'sheep', 'pig', 'goat', 'chicken'].map(k => `${k}: **${store.animals[k] ?? '—'}**`).join('\n');
       const sales = store.sales;
       return await i.reply({ embeds: [new EmbedBuilder().setTitle(`${store.name} — Ranch Report`)
         .setColor(0x71895b).addFields(
           { name: 'Products (latest ranch totals)', value: products },
-          { name: 'Animals (net changes seen)', value: animals },
           { name: 'Animal sales seen', value: `${sales.count} sold · $${sales.revenue} total\nSeller cuts: $${sales.sellerCut} · Ledger shares: $${sales.ledgerShare}` })
-        .setFooter({ text: 'Animal numbers reflect recorded buys and sales, not a verified live count.' })] });
+        .setFooter({ text: 'Sales figures come from recognised ranch webhooks.' })] });
     }
   } catch (error) {
     console.error(error);
