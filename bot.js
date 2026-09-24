@@ -22,7 +22,8 @@ function guild(id) { return db.guilds[id] ||= { ranches: {} }; }
 function ranch(id, key) { return guild(id).ranches[key]; }
 function fresh(name, channelId, ranchId = null, ownerId = null) {
   return { name, channelId, ranchId, products: {}, animals: {},
-    ownerId, employees: {}, purchases: {}, sales: { count: 0, revenue: 0, sellerCut: 0, ledgerShare: 0 }, seen: {} };
+    ownerId, managerIds: [], employees: {}, purchases: {},
+    sales: { count: 0, revenue: 0, sellerCut: 0, ledgerShare: 0 }, seen: {} };
 }
 function apply(store, event, messageId, timestamp) {
   if (!event || store.seen[messageId]) return false;
@@ -45,7 +46,9 @@ function apply(store, event, messageId, timestamp) {
   return true;
 }
 const admin = PermissionFlagsBits.ManageGuild;
-const canManage = (i, store) => i.memberPermissions?.has(admin) || store.ownerId === i.user.id;
+const canSeeMoney = (i, store) => store.ownerId === i.user.id ||
+  (store.managerIds || []).includes(i.user.id);
+const canManage = (i, store) => i.memberPermissions?.has(admin) || canSeeMoney(i, store);
 const choose = c => c.addStringOption(o => o.setName('ranch').setDescription('Choose a ranch')
   .setRequired(true).setAutocomplete(true));
 const commands = [
@@ -56,7 +59,14 @@ const commands = [
     .addStringOption(o => o.setName('ranch_id').setDescription('Optional in-game ranch number, for example 52')),
   choose(new SlashCommandBuilder().setName('removeranch').setDescription('Remove a ranch you added')),
   new SlashCommandBuilder().setName('ranches').setDescription('List connected ranches'),
-  choose(new SlashCommandBuilder().setName('ranchstats').setDescription('Show product, animal, and sales figures')),
+  choose(new SlashCommandBuilder().setName('ranchstats').setDescription('Show ranch product totals')),
+  choose(new SlashCommandBuilder().setName('ranchmoney').setDescription('Privately view ranch sale figures')),
+  choose(new SlashCommandBuilder().setName('employeemoney').setDescription('Privately view one employee’s sale figures'))
+    .addStringOption(o => o.setName('name').setDescription('Employee name').setRequired(true).setAutocomplete(true)),
+  choose(new SlashCommandBuilder().setName('addmanager').setDescription('Give a Discord user ranch manager access'))
+    .addUserOption(o => o.setName('user').setDescription('Discord account of the manager').setRequired(true)),
+  choose(new SlashCommandBuilder().setName('removemanager').setDescription('Revoke a Discord user’s ranch manager access'))
+    .addUserOption(o => o.setName('user').setDescription('Discord account of the manager').setRequired(true)),
   choose(new SlashCommandBuilder().setName('refresh_ranch').setDescription('Rebuild figures from webhook history')),
   choose(new SlashCommandBuilder().setName('checkranch').setDescription('Check webhook access and parsing for a ranch')),
   choose(new SlashCommandBuilder().setName('addemployee').setDescription('Add a person to a ranch employee list'))
@@ -101,6 +111,7 @@ async function refresh(guildId, key) {
     if (batch.size < 100) break;
   }
   const next = fresh(old.name, old.channelId, old.ranchId, old.ownerId);
+  next.managerIds = [...(old.managerIds || [])];
   for (const person of Object.values(old.employees || {})) {
     ensureEmployee(next, person.name).cutoffs = { ...(person.cutoffs || {}) };
   }
@@ -163,11 +174,30 @@ client.on('interactionCreate', async i => {
     const key = i.options.getString('ranch', true);
     const store = ranch(i.guildId, key);
     if (!store) return await i.reply({ content: 'Ranch not found.', ephemeral: true });
-    if (['removeranch', 'refresh_ranch', 'addemployee', 'settleemployee'].includes(name) && !canManage(i, store))
-      return await i.reply({ content: 'Only the person who added this ranch or a server manager can do that.', ephemeral: true });
+    if (name === 'removeranch' && store.ownerId !== i.user.id && !i.memberPermissions?.has(admin))
+      return await i.reply({ content: 'Only the ranch owner or a server manager can remove this ranch.', ephemeral: true });
+    if (['refresh_ranch', 'addemployee', 'settleemployee'].includes(name) && !canManage(i, store))
+      return await i.reply({ content: 'Only this ranch’s owner, a ranch manager, or a server manager can do that.', ephemeral: true });
+    if (['addmanager', 'removemanager'].includes(name) && store.ownerId !== i.user.id)
+      return await i.reply({ content: 'Only the person who added this ranch can change its managers.', ephemeral: true });
+    if (['ranchmoney', 'employeemoney'].includes(name) && !canSeeMoney(i, store))
+      return await i.reply({ content: 'Only this ranch’s owner and appointed managers can view money.', ephemeral: true });
     if (name === 'removeranch') {
       delete guild(i.guildId).ranches[key]; save();
       return await i.reply({ content: `Removed **${store.name}** and its tracked data.`, ephemeral: true });
+    }
+    if (name === 'addmanager' || name === 'removemanager') {
+      const user = i.options.getUser('user', true);
+      store.managerIds ||= [];
+      if (user.bot || user.id === store.ownerId)
+        return await i.reply({ content: 'Choose a Discord user other than the ranch owner or a bot.', ephemeral: true });
+      if (name === 'addmanager') {
+        if (!store.managerIds.includes(user.id)) store.managerIds.push(user.id);
+      } else {
+        store.managerIds = store.managerIds.filter(id => id !== user.id);
+      }
+      save();
+      return await i.reply({ content: `${name === 'addmanager' ? 'Granted' : 'Removed'} ranch manager access for ${user} at **${store.name}**.`, ephemeral: true });
     }
     if (name === 'refresh_ranch') {
       await i.deferReply({ ephemeral: true });
@@ -227,18 +257,26 @@ client.on('interactionCreate', async i => {
         .setColor(0x71895b).addFields(
           { name: 'Products collected', value: line(person.collected) },
           { name: 'Animals bought', value: line(person.bought) },
-          { name: 'Animals delivered in sales', value: line(person.sold) },
-          { name: 'Recorded sale figures', value: `Gross: $${person.saleRevenue} · Seller cuts: $${person.sellerCut}` })
-        .setFooter({ text: 'Products and sale figures are since their last respective settlement; purchases are all recorded history.' })] });
+          { name: 'Animals delivered in sales', value: line(person.sold) })
+        .setFooter({ text: 'Product and delivery counts are since their last respective settlement.' })] });
+    }
+    if (name === 'employeemoney') {
+      const person = store.employees?.[employeeKey(i.options.getString('name', true))];
+      if (!person) return await i.reply({ content: 'Employee not found.', ephemeral: true });
+      return await i.reply({ content: `**${person.name} — ${store.name}**\nRecorded animal sales since last pay settlement: **$${person.saleRevenue || 0}** gross; **$${person.sellerCut || 0}** seller cut.\nThese webhook amounts are not a verified wage balance.`, ephemeral: true });
+    }
+    if (name === 'ranchmoney') {
+      const sales = store.sales;
+      return await i.reply({ content: `**${store.name} — Recorded Animal Sales**\n` +
+        `Delivered: **${sales.count}** · Gross: **$${sales.revenue}**\n` +
+        `Seller cuts: **$${sales.sellerCut}** · Ledger shares: **$${sales.ledgerShare}**\n` +
+        `These are recorded sale proceeds, not the ranch’s current ledger balance.`, ephemeral: true });
     }
     if (name === 'ranchstats') {
       const products = Object.entries(store.products).map(([k, v]) => `${k}: **${v}**`).join('\n') || 'No product totals yet';
-      const sales = store.sales;
       return await i.reply({ embeds: [new EmbedBuilder().setTitle(`${store.name} — Ranch Report`)
         .setColor(0x71895b).addFields(
-          { name: 'Products (latest ranch totals)', value: products },
-          { name: 'Animal sales seen', value: `${sales.count} sold · $${sales.revenue} total\nSeller cuts: $${sales.sellerCut} · Ledger shares: $${sales.ledgerShare}` })
-        .setFooter({ text: 'Sales figures come from recognised ranch webhooks.' })] });
+          { name: 'Products (latest ranch totals)', value: products })] });
     }
   } catch (error) {
     console.error(error);
