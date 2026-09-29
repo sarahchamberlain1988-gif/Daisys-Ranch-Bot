@@ -16,6 +16,17 @@ Discord bot for ranch webhook reports. Its Application ID is already set to `155
 
 For Railway, deploy this folder as a Node service. Set `DISCORD_TOKEN` in Variables and attach a persistent volume mounted at `/data`. Railway supplies `RAILWAY_VOLUME_MOUNT_PATH` automatically. Without a volume, figures may reset when the service redeploys; `/refresh_ranch` can rebuild webhook history but cannot restore settlement cutoffs.
 
+## Google Sheets wage ledger
+
+1. Create a private Google Sheet with `Wages`, `Rates`, and `Events` tabs, using the column headings and formulas in the setup conversation. The attached Apps Script web app must return the exact text `recorded` or `already recorded` for successful writes.
+2. In Railway Variables set `GOOGLE_SCRIPT_URL` to the deployed Apps Script web app URL ending in `/exec`, `GOOGLE_SCRIPT_SECRET` to the matching `BOT_SECRET` script property, and `GOOGLE_SCRIPT_RANCH_ID` to the in-game ranch number (for example `52`). Never put the URL or secret in GitHub or a Discord command. Only the ranch with this exact ID is forwarded; other ranches remain independent. No Google service account is needed.
+3. Redeploy the bot. Run `/refresh_ranch` for that ranch to rebuild its event history, then `/syncsheet` to retry any events not yet confirmed by the sheet.
+4. New milk, eggs, wool and animal sale webhooks are sent to `Events`. The sheet uses the per-item rates in `Rates`: milk $3, eggs $1.50, wool $4 for employees. A sale's wage is the webhook **ledger** amount less five times that animal's replacement cost, even if fewer than five were delivered. Negative sale results carry against other earnings; `Pay due` stops at zero. The ranch product share and ledger amount are visible in `Events` to sheet editors.
+5. A ranch owner or appointed manager can use `/keepstock ranch:<ranch> name:<employee> product:<milk|eggs|wool> quantity:<number>` when collected products are kept. The sheet deducts the employee rate for that quantity. Animal purchases, slaughter and chores never enter this wage sheet.
+6. When paying an employee, use `/settleemployee` with **Pay handed out** or **Both** and enter `amount`. This records the payment and resets the bot's employee lookup cutoff. A products-only settlement still resets the product lookup; use `/keepstock` to deduct products retained instead of cash wages. The sheet preserves all events and payments as an audit trail.
+
+Each webhook message and manager action has a unique Event ID. `/refresh_ranch` preserves manual entries and settlement cutoffs. The Apps Script checks IDs before writing, so refreshing or retrying does not add the same wage twice. The bot keeps unsynced events on its Railway volume; a failed connection can be retried with `/syncsheet`. Do not delete rows or edit Event IDs in the sheet. Add employee names to the `Wages` tab as they appear. Rates are editable, so changing them recalculates historical wages too—finish a pay period before altering rates, or make a new sheet for a new rate period.
+
 ## What the first version reads
 
 - `Eggs Collected`, `Wool Sheared`, `Milk Collected`: uses the webhook's **ranch total**, not a running sum of collected amounts.

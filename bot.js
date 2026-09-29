@@ -4,6 +4,7 @@ const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   PermissionFlagsBits, ChannelType, EmbedBuilder } = require('discord.js');
 const { parseEvent } = require('./parser');
 const { keyFor: employeeKey, ensureEmployee, recordEmployee, settleEmployee } = require('./employee');
+const { sheetEnabled, syncSheet } = require('./sheets');
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = '1552627525237346434';
@@ -23,7 +24,7 @@ function ranch(id, key) { return guild(id).ranches[key]; }
 function fresh(name, channelId, ranchId = null, ownerId = null) {
   return { name, channelId, ranchId, products: {}, animals: {},
     ownerId, managerIds: [], employees: {}, purchases: {},
-    sales: { count: 0, revenue: 0, sellerCut: 0, ledgerShare: 0 }, seen: {} };
+    sales: { count: 0, revenue: 0, sellerCut: 0, ledgerShare: 0 }, seen: {}, wageEvents: {} };
 }
 function apply(store, event, messageId, timestamp) {
   if (!event || store.seen[messageId]) return false;
@@ -43,6 +44,12 @@ function apply(store, event, messageId, timestamp) {
     store.sales.ledgerShare += event.ledgerShare;
   }
   recordEmployee(store, event, timestamp);
+  if (event.actor && ((event.type === 'product' && ['milk', 'eggs', 'wool'].includes(event.kind)) || event.type === 'sale')) {
+    store.wageEvents ||= {};
+    store.wageEvents[messageId] = { id: messageId, timestamp, employee: event.actor,
+      type: event.type, item: event.kind, quantity: event.quantity,
+      ledger: event.type === 'sale' ? event.ledgerShare : 0 };
+  }
   return true;
 }
 const admin = PermissionFlagsBits.ManageGuild;
@@ -68,6 +75,12 @@ const commands = [
   choose(new SlashCommandBuilder().setName('removemanager').setDescription('Revoke a Discord user’s ranch manager access'))
     .addUserOption(o => o.setName('user').setDescription('Discord account of the manager').setRequired(true)),
   choose(new SlashCommandBuilder().setName('refresh_ranch').setDescription('Rebuild figures from webhook history')),
+  choose(new SlashCommandBuilder().setName('syncsheet').setDescription('Send missing ranch events to the wage sheet')),
+  choose(new SlashCommandBuilder().setName('keepstock').setDescription('Deduct milk, eggs or wool kept by an employee'))
+    .addStringOption(o => o.setName('name').setDescription('Employee name').setRequired(true).setAutocomplete(true))
+    .addStringOption(o => o.setName('product').setDescription('Product kept').setRequired(true)
+      .addChoices({ name: 'Milk', value: 'milk' }, { name: 'Eggs', value: 'eggs' }, { name: 'Wool', value: 'wool' }))
+    .addIntegerOption(o => o.setName('quantity').setDescription('Amount kept').setRequired(true).setMinValue(1)),
   choose(new SlashCommandBuilder().setName('checkranch').setDescription('Check webhook access and parsing for a ranch')),
   choose(new SlashCommandBuilder().setName('addemployee').setDescription('Add a person to a ranch employee list'))
     .addStringOption(o => o.setName('name').setDescription('In-game name as it appears in webhooks').setRequired(true)),
@@ -78,6 +91,7 @@ const commands = [
     .addStringOption(o => o.setName('category').setDescription('What have you settled?').setRequired(true)
       .addChoices({ name: 'Products handed out', value: 'products' },
         { name: 'Pay handed out', value: 'pay' }, { name: 'Both', value: 'both' }))
+    .addNumberOption(o => o.setName('amount').setDescription('Money paid, required for pay settlement with a sheet').setMinValue(0))
 ].map(c => c.toJSON());
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
   GatewayIntentBits.MessageContent] });
@@ -112,6 +126,8 @@ async function refresh(guildId, key) {
   }
   const next = fresh(old.name, old.channelId, old.ranchId, old.ownerId);
   next.managerIds = [...(old.managerIds || [])];
+  next.sheetSent = { ...(old.sheetSent || {}) };
+  next.wageEvents = Object.fromEntries(Object.entries(old.wageEvents || {}).filter(([,e]) => e.type === 'kept' || e.type === 'payment'));
   for (const person of Object.values(old.employees || {})) {
     ensureEmployee(next, person.name).cutoffs = { ...(person.cutoffs || {}) };
   }
@@ -135,7 +151,10 @@ client.on('messageCreate', message => {
   const event = parseEvent(message);
   if (!event) return;
   for (const store of Object.values(guild(message.guildId).ranches)) {
-    if (store.channelId === message.channelId && apply(store, event, message.id, message.createdTimestamp)) save();
+    if (store.channelId === message.channelId && apply(store, event, message.id, message.createdTimestamp)) {
+      save();
+      if (sheetEnabled(store)) syncSheet(store).then(save).catch(error => console.error('Google Sheet sync failed; retry with /syncsheet:', error));
+    }
   }
 });
 client.on('interactionCreate', async i => {
@@ -178,6 +197,8 @@ client.on('interactionCreate', async i => {
       return await i.reply({ content: 'Only the ranch owner or a server manager can remove this ranch.', ephemeral: true });
     if (['refresh_ranch', 'addemployee', 'settleemployee'].includes(name) && !canManage(i, store))
       return await i.reply({ content: 'Only this ranch’s owner, a ranch manager, or a server manager can do that.', ephemeral: true });
+    if (['syncsheet', 'keepstock'].includes(name) && !canSeeMoney(i, store))
+      return await i.reply({ content: 'Only this ranch’s owner or appointed managers can do that.', ephemeral: true });
     if (['addmanager', 'removemanager'].includes(name) && store.ownerId !== i.user.id)
       return await i.reply({ content: 'Only the person who added this ranch can change its managers.', ephemeral: true });
     if (['ranchmoney', 'employeemoney'].includes(name) && !canSeeMoney(i, store))
@@ -202,7 +223,33 @@ client.on('interactionCreate', async i => {
     if (name === 'refresh_ranch') {
       await i.deferReply({ ephemeral: true });
       const result = await refresh(i.guildId, key);
-      return await i.editReply(`Read ${result.scanned} messages; recognised ${result.accepted} ranch events.`);
+      let syncNote = '';
+      if (sheetEnabled(ranch(i.guildId, key))) {
+        try { await syncSheet(ranch(i.guildId, key)); save(); }
+        catch (error) { console.error('Sheet sync pending:', error); syncNote = ' Sheet sync is pending; run /syncsheet after checking its access.'; }
+      }
+      return await i.editReply(`Read ${result.scanned} messages; recognised ${result.accepted} ranch events.${syncNote}`);
+    }
+    if (name === 'syncsheet') {
+      await i.deferReply({ ephemeral: true });
+      const added = await syncSheet(store);
+      save();
+      return await i.editReply(`Wage sheet synced: ${added} new event${added === 1 ? '' : 's'}.`);
+    }
+    if (name === 'keepstock') {
+      const person = store.employees?.[employeeKey(i.options.getString('name', true))];
+      if (!person) return await i.reply({ content: 'Employee not found.', ephemeral: true });
+      const item = i.options.getString('product', true), quantity = i.options.getInteger('quantity', true);
+      store.wageEvents ||= {};
+      const id = `kept-${i.id}`;
+      store.wageEvents[id] = { id, timestamp: Date.now(), employee: person.name, type: 'kept', item, quantity };
+      save();
+      let note = '';
+      if (sheetEnabled(store)) {
+        try { await syncSheet(store); save(); }
+        catch (error) { console.error('Sheet sync pending:', error); note = ' Sheet sync is pending; use /syncsheet to retry.'; }
+      }
+      return await i.reply({ content: `Recorded ${quantity} ${item} kept by **${person.name}**.${note}`, ephemeral: true });
     }
     if (name === 'checkranch') {
       await i.deferReply({ ephemeral: true });
@@ -244,9 +291,24 @@ client.on('interactionCreate', async i => {
       const person = store.employees?.[employeeKey(i.options.getString('name', true))];
       if (!person) return await i.reply({ content: 'Employee not found. Use /employee to check the name.', ephemeral: true });
       const category = i.options.getString('category', true);
+      const amount = i.options.getNumber('amount');
+      if (sheetEnabled(store) && (category === 'pay' || category === 'both') && amount == null)
+        return await i.reply({ content: 'Enter the amount paid so the wage sheet can subtract it.', ephemeral: true });
+      if (amount != null && category === 'products')
+        return await i.reply({ content: 'An amount can only be recorded with pay or both.', ephemeral: true });
+      if (amount != null) {
+        store.wageEvents ||= {};
+        const id = `payment-${i.id}`;
+        store.wageEvents[id] = { id, timestamp: Date.now(), employee: person.name, type: 'payment', payment: amount };
+      }
       settleEmployee(person, category);
       save();
-      return await i.reply({ content: `Marked **${person.name}**'s **${category}** as settled. New matching webhooks will count from now on; /refresh_ranch will keep this cutoff.`, ephemeral: true });
+      let note = '';
+      if (sheetEnabled(store)) {
+        try { await syncSheet(store); save(); }
+        catch (error) { console.error('Sheet sync pending:', error); note = ' Sheet sync is pending; use /syncsheet to retry.'; }
+      }
+      return await i.reply({ content: `Marked **${person.name}**'s **${category}** as settled. New matching webhooks will count from now on; /refresh_ranch will keep this cutoff.${note}`, ephemeral: true });
     }
     if (name === 'employee') {
       const lookup = employeeKey(i.options.getString('name', true));
